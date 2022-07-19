@@ -1,8 +1,7 @@
 extern crate cc;
 
 use std::env;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -23,7 +22,9 @@ pub struct Build {
 pub struct Artifacts {
     include_dir: PathBuf,
     lib_dir: PathBuf,
+    bin_dir: PathBuf,
     libs: Vec<String>,
+    target: String,
 }
 
 impl Build {
@@ -51,11 +52,64 @@ impl Build {
     }
 
     fn cmd_make(&self) -> Command {
-        match &self.host.as_ref().expect("HOST dir not set")[..] {
-            "x86_64-unknown-dragonfly" => Command::new("gmake"),
-            "x86_64-unknown-freebsd" => Command::new("gmake"),
-            _ => Command::new("make"),
+        let host = &self.host.as_ref().expect("HOST dir not set")[..];
+        if host.contains("dragonfly")
+            || host.contains("freebsd")
+            || host.contains("openbsd")
+            || host.contains("solaris")
+            || host.contains("illumos")
+        {
+            Command::new("gmake")
+        } else {
+            Command::new("make")
         }
+    }
+
+    #[cfg(windows)]
+    fn check_env_var(&self, var_name: &str) -> Option<bool> {
+        env::var_os(var_name).map(|s| {
+            if s == "1" {
+                // a message to stdout, let user know asm is force enabled
+                println!(
+                    "{}: nasm.exe is force enabled by the \
+                    'OPENSSL_RUST_USE_NASM' env var.",
+                    env!("CARGO_PKG_NAME")
+                );
+                true
+            } else if s == "0" {
+                // a message to stdout, let user know asm is force disabled
+                println!(
+                    "{}: nasm.exe is force disabled by the \
+                    'OPENSSL_RUST_USE_NASM' env var.",
+                    env!("CARGO_PKG_NAME")
+                );
+                false
+            } else {
+                panic!(
+                    "The environment variable {} is set to an unacceptable value: {:?}",
+                    var_name, s
+                );
+            }
+        })
+    }
+
+    #[cfg(windows)]
+    fn is_nasm_ready(&self) -> bool {
+        self.check_env_var("OPENSSL_RUST_USE_NASM")
+            .unwrap_or_else(|| {
+                // On Windows, use cmd `where` command to check if nasm is installed
+                let wherenasm = Command::new("cmd")
+                    .args(&["/C", "where nasm"])
+                    .output()
+                    .expect("Failed to execute `cmd`.");
+                wherenasm.status.success()
+            })
+    }
+
+    #[cfg(not(windows))]
+    fn is_nasm_ready(&self) -> bool {
+        // We assume that nobody would run nasm.exe on a non-windows system.
+        false
     }
 
     pub fn build(&mut self) -> Artifacts {
@@ -77,17 +131,31 @@ impl Build {
         cp_r(&source_dir(), &inner_dir);
         apply_patches(target, &inner_dir);
 
-        let mut configure = Command::new("perl");
+        let perl_program =
+            env::var("OPENSSL_SRC_PERL").unwrap_or(env::var("PERL").unwrap_or("perl".to_string()));
+        let mut configure = Command::new(perl_program);
         configure.arg("./Configure");
+
+        // Change the install directory to happen inside of the build directory.
         if host.contains("pc-windows-gnu") {
             configure.arg(&format!("--prefix={}", sanitize_sh(&install_dir)));
         } else {
             configure.arg(&format!("--prefix={}", install_dir.display()));
         }
 
+        // Specify that openssl directory where things are loaded at runtime is
+        // not inside our build directory. Instead this should be located in the
+        // default locations of the OpenSSL build scripts.
+        if target.contains("windows") {
+            configure.arg("--openssldir=SYS$MANAGER:[OPENSSL]");
+        } else {
+            configure.arg("--openssldir=/usr/local/ssl");
+        }
+
         configure
             // No shared objects, we just want static libraries
             .arg("no-dso")
+            .arg("no-shared")
             // Should be off by default on OpenSSL 1.1.0, but let's be extra sure
             .arg("no-ssl3")
             // No need to build tests, we won't run them anyway
@@ -95,17 +163,39 @@ impl Build {
             // Nothing related to zlib please
             .arg("no-comp")
             .arg("no-zlib")
-            .arg("no-zlib-dynamic")
+            .arg("no-zlib-dynamic");
+
+        if cfg!(not(feature = "weak-crypto")) {
+            configure
+                .arg("no-md2")
+                .arg("no-rc5")
+                .arg("no-weak-ssl-ciphers");
+        }
+
+        if cfg!(not(feature = "camellia")) {
+            configure.arg("no-camellia");
+        }
+
+        if cfg!(not(feature = "idea")) {
+            configure.arg("no-idea");
+        }
+
+        if cfg!(not(feature = "seed")) {
+            configure.arg("no-seed");
+        }
+
+        if target.contains("musl") || target.contains("windows") {
             // This actually fails to compile on musl (it needs linux/version.h
-            // right now) but we don't actually need this most of the time. This
-            // is intended for super-configurable backends and whatnot
-            // apparently but the whole point of this script is to produce a
-            // "portable" implementation of OpenSSL, so shouldn't be any harm in
-            // turning this off.
-            .arg("no-engine")
+            // right now) but we don't actually need this most of the time.
+            // API of engine.c ld fail in Windows.
+            configure.arg("no-engine");
+        }
+
+        if target.contains("musl") {
             // MUSL doesn't implement some of the libc functions that the async
             // stuff depends on, and we don't bind to any of that in any case.
-            .arg("no-async");
+            configure.arg("no-async");
+        }
 
         // On Android it looks like not passing no-stdio may cause a build
         // failure (#13), but most other platforms need it for things like
@@ -115,26 +205,29 @@ impl Build {
         }
 
         if target.contains("msvc") {
-            // On MSVC we need nasm.exe to compile the assembly files, but let's
-            // just pessimistically assume for now that's not available.
-            configure.arg("no-asm");
-
-            let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or(String::new());
-            if features.contains("crt-static") {
-                configure.arg("no-shared");
+            // On MSVC we need nasm.exe to compile the assembly files.
+            // ASM compiling will be enabled if nasm.exe is installed, unless
+            // the environment variable `OPENSSL_RUST_USE_NASM` is set.
+            if self.is_nasm_ready() {
+                // a message to stdout, let user know asm is enabled
+                println!(
+                    "{}: Enable the assembly language routines in building OpenSSL.",
+                    env!("CARGO_PKG_NAME")
+                );
+            } else {
+                configure.arg("no-asm");
             }
-        } else {
-            // Never shared on non-MSVC
-            configure.arg("no-shared");
         }
 
         let os = match target {
+            "aarch64-apple-darwin" => "darwin64-arm64-cc",
             // Note that this, and all other android targets, aren't using the
             // `android64-aarch64` (or equivalent) builtin target. That
             // apparently has a crazy amount of build logic in OpenSSL 1.1.1
             // that bypasses basically everything `cc` does, so let's just cop
             // out and say it's linux and hope it works.
             "aarch64-linux-android" => "linux-aarch64",
+            "aarch64-unknown-freebsd" => "BSD-generic64",
             "aarch64-unknown-linux-gnu" => "linux-aarch64",
             "aarch64-unknown-linux-musl" => "linux-aarch64",
             "aarch64-pc-windows-msvc" => "VC-WIN64-ARM",
@@ -144,9 +237,17 @@ impl Build {
             "arm-unknown-linux-gnueabihf" => "linux-armv4",
             "arm-unknown-linux-musleabi" => "linux-armv4",
             "arm-unknown-linux-musleabihf" => "linux-armv4",
+            "armv5te-unknown-linux-gnueabi" => "linux-armv4",
+            "armv5te-unknown-linux-musleabi" => "linux-armv4",
+            "armv6-unknown-freebsd" => "BSD-generic32",
+            "armv7-unknown-freebsd" => "BSD-generic32",
+            "armv7-unknown-linux-gnueabi" => "linux-armv4",
+            "armv7-unknown-linux-musleabi" => "linux-armv4",
             "armv7-unknown-linux-gnueabihf" => "linux-armv4",
             "armv7-unknown-linux-musleabihf" => "linux-armv4",
             "asmjs-unknown-emscripten" => "gcc",
+            "i586-unknown-linux-gnu" => "linux-elf",
+            "i586-unknown-linux-musl" => "linux-elf",
             "i686-apple-darwin" => "darwin-i386-cc",
             "i686-linux-android" => "linux-elf",
             "i686-pc-windows-gnu" => "mingw",
@@ -157,24 +258,37 @@ impl Build {
             "mips-unknown-linux-gnu" => "linux-mips32",
             "mips-unknown-linux-musl" => "linux-mips32",
             "mips64-unknown-linux-gnuabi64" => "linux64-mips64",
+            "mips64-unknown-linux-muslabi64" => "linux64-mips64",
             "mips64el-unknown-linux-gnuabi64" => "linux64-mips64",
+            "mips64el-unknown-linux-muslabi64" => "linux64-mips64",
             "mipsel-unknown-linux-gnu" => "linux-mips32",
             "mipsel-unknown-linux-musl" => "linux-mips32",
+            "powerpc-unknown-freebsd" => "BSD-generic32",
             "powerpc-unknown-linux-gnu" => "linux-ppc",
+            "powerpc64-unknown-freebsd" => "BSD-generic64",
             "powerpc64-unknown-linux-gnu" => "linux-ppc64",
+            "powerpc64-unknown-linux-musl" => "linux-ppc64",
+            "powerpc64le-unknown-freebsd" => "BSD-generic64",
             "powerpc64le-unknown-linux-gnu" => "linux-ppc64le",
+            "powerpc64le-unknown-linux-musl" => "linux-ppc64le",
+            "riscv64gc-unknown-linux-gnu" => "linux-generic64",
             "s390x-unknown-linux-gnu" => "linux64-s390x",
+            "s390x-unknown-linux-musl" => "linux64-s390x",
             "x86_64-apple-darwin" => "darwin64-x86_64-cc",
             "x86_64-linux-android" => "linux-x86_64",
             "x86_64-pc-windows-gnu" => "mingw64",
             "x86_64-pc-windows-msvc" => "VC-WIN64A",
             "x86_64-unknown-freebsd" => "BSD-x86_64",
             "x86_64-unknown-dragonfly" => "BSD-x86_64",
+            "x86_64-unknown-illumos" => "solaris64-x86_64-gcc",
             "x86_64-unknown-linux-gnu" => "linux-x86_64",
             "x86_64-unknown-linux-musl" => "linux-x86_64",
+            "x86_64-unknown-openbsd" => "BSD-x86_64",
             "x86_64-unknown-netbsd" => "BSD-x86_64",
+            "x86_64-sun-solaris" => "solaris64-x86_64-gcc",
             "wasm32-unknown-emscripten" => "gcc",
             "wasm32-unknown-unknown" => "gcc",
+            "wasm32-wasi" => "gcc",
             "aarch64-apple-ios" => "ios64-cross",
             "x86_64-apple-ios" => "iossimulator-xcrun",
             _ => panic!("don't know how to configure OpenSSL for {}", target),
@@ -204,8 +318,12 @@ impl Build {
             // as well.
             if path.ends_with("-gcc") && !target.contains("unknown-linux-musl") {
                 let path = &path[..path.len() - 4];
-                configure.env("RANLIB", format!("{}-ranlib", path));
-                configure.env("AR", format!("{}-ar", path));
+                if env::var_os("RANLIB").is_none() {
+                    configure.env("RANLIB", format!("{}-ranlib", path));
+                }
+                if env::var_os("AR").is_none() {
+                    configure.env("AR", format!("{}-ar", path));
+                }
             }
 
             // Make sure we pass extra flags like `-ffunction-sections` and
@@ -219,13 +337,18 @@ impl Build {
                     continue;
                 }
 
-                // cargo-lipo specifies this but OpenSSL complains
-                if target.contains("apple-ios") {
+                // cc includes an `-arch` flag for Apple platforms, but we've
+                // already selected an arch implicitly via the target above, and
+                // OpenSSL contains about the conflict if both are specified.
+                if target.contains("apple") {
                     if arg == "-arch" {
                         skip_next = true;
                         continue;
                     }
+                }
 
+                // cargo-lipo specifies this but OpenSSL complains
+                if target.contains("apple-ios") {
                     if arg == "-isysroot" {
                         is_isysroot = true;
                         continue;
@@ -310,12 +433,12 @@ impl Build {
         if target.contains("msvc") {
             let mut build =
                 cc::windows_registry::find(target, "nmake.exe").expect("failed to find nmake");
-            build.current_dir(&inner_dir);
+            build.arg("build_libs").current_dir(&inner_dir);
             self.run_command(build, "building OpenSSL");
 
             let mut install =
                 cc::windows_registry::find(target, "nmake.exe").expect("failed to find nmake");
-            install.arg("install_sw").current_dir(&inner_dir);
+            install.arg("install_dev").current_dir(&inner_dir);
             self.run_command(install, "installing OpenSSL");
         } else {
             let mut depend = self.cmd_make();
@@ -323,7 +446,7 @@ impl Build {
             self.run_command(depend, "building OpenSSL dependencies");
 
             let mut build = self.cmd_make();
-            build.current_dir(&inner_dir);
+            build.arg("build_libs").current_dir(&inner_dir);
             if !cfg!(windows) {
                 if let Some(s) = env::var_os("CARGO_MAKEFLAGS") {
                     build.env("MAKEFLAGS", s);
@@ -339,7 +462,7 @@ impl Build {
             self.run_command(build, "building OpenSSL");
 
             let mut install = self.cmd_make();
-            install.arg("install_sw").current_dir(&inner_dir);
+            install.arg("install_dev").current_dir(&inner_dir);
             self.run_command(install, "installing OpenSSL");
         }
 
@@ -353,8 +476,10 @@ impl Build {
 
         Artifacts {
             lib_dir: install_dir.join("lib"),
+            bin_dir: install_dir.join("bin"),
             include_dir: install_dir.join("include"),
             libs: libs,
+            target: target.to_string(),
         }
     }
 
@@ -402,24 +527,24 @@ fn cp_r(src: &Path, dst: &Path) {
 }
 
 fn apply_patches(target: &str, inner: &Path) {
+    apply_patches_musl(target, inner);
+}
+
+fn apply_patches_musl(target: &str, inner: &Path) {
     if !target.contains("musl") {
         return;
     }
 
     // Undo part of https://github.com/openssl/openssl/commit/c352bd07ed2ff872876534c950a6968d75ef121e on MUSL
     // since it doesn't have asm/unistd.h
-    let mut buf = String::new();
     let path = inner.join("crypto/rand/rand_unix.c");
-    File::open(&path).unwrap().read_to_string(&mut buf).unwrap();
+    let buf = fs::read_to_string(&path).unwrap();
 
     let buf = buf
         .replace("asm/unistd.h", "sys/syscall.h")
         .replace("__NR_getrandom", "SYS_getrandom");
 
-    File::create(&path)
-        .unwrap()
-        .write_all(buf.as_bytes())
-        .unwrap();
+    fs::write(path, buf).unwrap();
 }
 
 fn sanitize_sh(path: &Path) -> String {
@@ -462,5 +587,8 @@ impl Artifacts {
         }
         println!("cargo:include={}", self.include_dir.display());
         println!("cargo:lib={}", self.lib_dir.display());
+        if self.target.contains("msvc") {
+            println!("cargo:rustc-link-lib=user32");
+        }
     }
 }

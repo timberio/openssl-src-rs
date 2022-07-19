@@ -1,148 +1,125 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [master, release/111]
+  pull_request:
+    branches: [master, release/111]
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   test:
     name: Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        thing:
-        - stable
-        - beta
-        - nightly
-        - macos-x86_64
-        - arm-android
-        - arm64-android
-        - i686-android
-        - x86_64-android
-        - i686-linux
-        - arm-linux
-        - aarch64-linux
-        - x86_64-musl
-        - x86_64-mingw
-        - asmjs
-        - i686-msvc
-        - i686-msvc-static
-        - x86_64-msvc
-        - x86_64-msvc-static
         include:
-        - thing: stable
-          target: x86_64-unknown-linux-gnu
+        - target: x86_64-unknown-linux-gnu
           rust: stable
           os: ubuntu-latest
-        - thing: beta
-          target: x86_64-unknown-linux-gnu
+        - target: x86_64-unknown-linux-gnu
           rust: beta
           os: ubuntu-latest
-        - thing: nightly
-          target: x86_64-unknown-linux-gnu
+        - target: x86_64-unknown-linux-gnu
           rust: nightly
           os: ubuntu-latest
-        - thing: macos-x86_64
-          target: x86_64-apple-darwin
+        - target: x86_64-apple-darwin
           rust: stable
           os: macos-latest
-        - thing: arm-android
-          target: arm-linux-androideabi
+        - target: aarch64-apple-darwin
+          rust: nightly
+          os: macos-latest
+        #- target: arm-linux-androideabi
+        #  rust: stable
+        #  os: ubuntu-latest
+        - target: aarch64-linux-android
           rust: stable
           os: ubuntu-latest
-        - thing: arm64-android
-          target: aarch64-linux-android
+        - target: i686-linux-android
           rust: stable
           os: ubuntu-latest
-        - thing: i686-android
-          target: i686-linux-android
+        - target: x86_64-linux-android
           rust: stable
           os: ubuntu-latest
-        - thing: x86_64-android
-          target: x86_64-linux-android
+        - target: i686-unknown-linux-gnu
           rust: stable
           os: ubuntu-latest
-        - thing: i686-linux
-          target: i686-unknown-linux-gnu
+        - target: arm-unknown-linux-gnueabi
           rust: stable
           os: ubuntu-latest
-        - thing: arm-linux
-          target: arm-unknown-linux-gnueabi
+        - target: aarch64-unknown-linux-gnu
           rust: stable
           os: ubuntu-latest
-        - thing: aarch64-linux
-          target: aarch64-unknown-linux-gnu
+        - target: x86_64-unknown-linux-musl
           rust: stable
           os: ubuntu-latest
-        - thing: x86_64-musl
-          target: x86_64-unknown-linux-musl
+        - target: x86_64-pc-windows-gnu
           rust: stable
           os: ubuntu-latest
-        - thing: x86_64-mingw
-          target: x86_64-pc-windows-gnu
-          rust: stable
-          os: ubuntu-latest
-        - thing: asmjs
-          target: asmjs-unknown-emscripten
-          rust: stable
-          os: ubuntu-latest
-        - thing: i686-msvc
-          target: i686-pc-windows-msvc
+        # - target: asmjs-unknown-emscripten
+        #   rust: stable
+        #   os: ubuntu-latest
+        - target: i686-pc-windows-msvc
           rust: stable-i686-msvc
-          os: windows-2016
-        - thing: i686-msvc-static
-          target: i686-pc-windows-msvc
+          os: windows-2019
+        - target: i686-pc-windows-msvc
           rust: stable-i686-msvc
-          os: windows-2016
-          crt_static: true
-        - thing: x86_64-msvc
-          target: x86_64-pc-windows-msvc
+          os: windows-2019
+          crt_static: yes
+        - target: x86_64-pc-windows-msvc
           rust: stable-x86_64-msvc
           os: windows-latest
-        - thing: x86_64-msvc-static
-          target: x86_64-pc-windows-msvc
+        - target: x86_64-pc-windows-msvc
           rust: stable-x86_64-msvc
           os: windows-latest
-          crt_static: true
+          crt_static: yes
+        - target: x86_64-pc-windows-msvc
+          rust: stable-x86_64-msvc
+          os: windows-latest
+          nasm_exe: installed
 
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@v1
       with:
         submodules: true
     - name: Install Rust (rustup)
       run: rustup update ${{ matrix.rust }} --no-self-update && rustup default ${{ matrix.rust }}
-      if: matrix.os != 'macos-latest'
-      shell: bash
-    - name: Install Rust (macos)
-      run: |
-        curl https://sh.rustup.rs | sh -s -- -y
-        echo ::add-path::$HOME/.cargo/bin
-      if: matrix.os == 'macos-latest'
     - run: rustup target add ${{ matrix.target }}
     - name: Set crt-static
       if: matrix.crt_static == 'yes'
-      run: echo ::set-env name=RUSTFLAGS::-Ctarget-feature=+crt-static
-      shell: bash
+      run: echo RUSTFLAGS=-Ctarget-feature=+crt-static >> $GITHUB_ENV
     - name: Use strawberry perl
       if: startsWith(matrix.os, 'windows')
-      run: echo ::add-path::C:/Strawberry/perl/bin
-      shell: bash
-    - run: |
+      run: echo OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl >> $GITHUB_ENV
+    - name: Run tests (not Windows)
+      if: "!startsWith(matrix.os, 'windows')"
+      run: |
         set -e
         cargo generate-lockfile
         ./ci/run-docker.sh ${{ matrix.target }}
-      if: "!startsWith(matrix.os, 'windows')"
-      name: Run tests (not Windows)
-    - run: |
-        cargo test --manifest-path testcrate/Cargo.toml --target ${{ matrix.target }}
-        cargo test --manifest-path testcrate/Cargo.toml --target ${{ matrix.target }} --release
-        cargo run --release --target ${{ matrix.target }} --manifest-path testcrate/Cargo.toml --features package
+    - name: Download nasm.exe (Windows)
+      if: matrix.nasm_exe == 'installed'
+      run: |
+        WINNASMVERSION='2.15.05'
+        curl -O https://www.nasm.us/pub/nasm/releasebuilds/${WINNASMVERSION}/win64/nasm-${WINNASMVERSION}-win64.zip
+        unzip nasm-${WINNASMVERSION}-win64.zip
+        echo "$GITHUB_WORKSPACE\\nasm-${WINNASMVERSION}" >> $GITHUB_PATH
+        echo "OPENSSL_RUST_USE_NASM=1" >> $GITHUB_ENV
+    - name: Run tests (Windows)
       if: startsWith(matrix.os, 'windows')
-      name: Run tests (Windows)
-      shell: cmd
+      run: |
+        cargo test --manifest-path testcrate/Cargo.toml --target ${{ matrix.target }} -vv
+        cargo test --manifest-path testcrate/Cargo.toml --target ${{ matrix.target }} --release -vv
+        cargo run --release --target ${{ matrix.target }} --manifest-path testcrate/Cargo.toml --features package -vv
 
   rustfmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@master
+    - uses: actions/checkout@v1
     - name: Install Rust
       run: rustup update stable && rustup default stable && rustup component add rustfmt
     - run: cargo fmt -- --check
