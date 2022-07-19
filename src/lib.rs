@@ -188,7 +188,10 @@ impl Build {
             // This actually fails to compile on musl (it needs linux/version.h
             // right now) but we don't actually need this most of the time.
             // API of engine.c ld fail in Windows.
-            configure.arg("no-engine");
+
+            // Vector needs ENGINE support because rdkafka
+            // (librdkafka), introduced a dependency it
+            // configure.arg("no-engine");
         }
 
         if target.contains("musl") {
